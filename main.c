@@ -37,6 +37,8 @@ int main(int argc, char **argv) {
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--pipeline") == 0) {
             pipe_mode = 1;
+        } else if (strcmp(argv[i], "--pipeline-forward") == 0) {
+            pipe_mode = 2;
         } else if (strcmp(argv[i], "--batch") == 0) {
             batch_mode = 1;
         } else if (strcmp(argv[i], "--max-cycles") == 0 && i + 1 < argc) {
@@ -80,7 +82,7 @@ int main(int argc, char **argv) {
     cpu_reset(&cpu, entry_point);
 
     if (pipe_mode) {
-        Pipeline pl; pipeline_init(&pl);
+        Pipeline pl; pipeline_init(&pl, pipe_mode == 2);
         pipeline_run_batch(&pl, &cpu, &mem, max_cycles);
     } else if (batch_mode) {
         run_batch(&cpu, &mem, max_cycles);
