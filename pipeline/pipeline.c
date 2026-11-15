@@ -1,6 +1,9 @@
 #include "pipeline_state.h"
 #include "control.h"
+#include "hazard.h"
 #include "../core/decoder.h"
+#include "../core/memory.h"     /* memory_read_* / memory_write_* for IF and MEM */
+#include "../core/cpu_state.h"  /* cpu_read_reg / cpu_write_reg */
 #include "../ui/cli_display.h"
 
 #include <stdio.h>
@@ -16,8 +19,9 @@
 #define OP_LUI    0x37
 #define OP_AUIPC  0x17
 
-void pipeline_init(Pipeline *p) {
+void pipeline_init(Pipeline *p, int forwarding) {
     memset(p, 0, sizeof(*p));
+    p->forwarding = forwarding;
 }
 
 /* ------------------------------------------------------------------ */
@@ -64,27 +68,6 @@ static uint32_t alu(const DecodedInstr *i, uint32_t pc, uint32_t a, uint32_t b) 
             break;
     }
     return 0;
-}
-
-/* ------------------------------------------------------------------ */
-/* Task 4 hazard check (naive): stall if a source register of the     */
-/* instruction in ID is the destination of ANY older instruction      */
-/* still in ID/EX, EX/MEM or MEM/WB. No forwarding.                   */
-/* ------------------------------------------------------------------ */
-static int writes_reg(int valid, const ControlSignals *c, uint32_t rd, uint32_t r) {
-    return valid && c->reg_write && rd != 0 && rd == r;
-}
-
-static int depends_on(const Pipeline *p, uint32_t r) {
-    if (r == 0) return 0;  /* x0 never causes a hazard */
-    return writes_reg(p->id_ex.valid,  &p->id_ex.ctrl,  p->id_ex.instr.rd,  r) ||
-           writes_reg(p->ex_mem.valid, &p->ex_mem.ctrl, p->ex_mem.instr.rd, r) ||
-           writes_reg(p->mem_wb.valid, &p->mem_wb.ctrl, p->mem_wb.instr.rd, r);
-}
-
-static int hazard_detected(const Pipeline *p, const DecodedInstr *d, const ControlSignals *c) {
-    return (c->uses_rs1 && depends_on(p, d->rs1)) ||
-           (c->uses_rs2 && depends_on(p, d->rs2));
 }
 
 /* ------------------------------------------------------------------ */
@@ -206,11 +189,18 @@ CPUStatus pipeline_cycle(Pipeline *p, CPUState *cpu, Memory *mem) {
         o->instr      = d->instr;
         o->handler    = d->handler;
         o->ctrl       = d->ctrl;
-        o->store_val  = d->rs2_val;
         o->alu_result = 0;
 
+        /* Forwarding unit: a/b are the operands EX really uses. All four
+         * consumers below (ALU, store data, branch compare, jalr target)
+         * must use them, never d->rs1_val / d->rs2_val. */
+        Operands fw = forward_operands(p, d);
+        nx.fwd_ex  += (uint64_t)fw.fwd_ex;
+        nx.fwd_mem += (uint64_t)fw.fwd_mem;
+        o->store_val = fw.b;                                           /* store data */
+
         if (d->fault == PF_NONE) {
-            uint32_t a = d->rs1_val, b = d->rs2_val;
+            uint32_t a = fw.a, b = fw.b;
             uint32_t imm = (uint32_t)d->instr.imm;
 
             if (d->ctrl.is_branch) {
@@ -257,8 +247,13 @@ CPUStatus pipeline_cycle(Pipeline *p, CPUState *cpu, Memory *mem) {
             } else {
                 ControlSignals c = control_decode(&d, h);
 
-                if (hazard_detected(p, &d, &c)) {
-                    stall = 1;                           /* nx.id_ex stays a bubble */
+                HazardVerdict hz = hazard_check(p, &d, &c);
+                if (hz.stall) {
+                    o->valid = 0;                        /* 1. bubble enters EX      */
+                    nx.if_id = p->if_id;                 /* 2. IF/ID frozen           */
+                    stall = 1;                           /* 3. IF must not fetch      */
+                    nx.stalls++;
+                    if (hz.load_use) nx.load_use_stalls++;
                 } else {
                     o->valid   = 1;
                     o->fault   = PF_NONE;
@@ -273,10 +268,7 @@ CPUStatus pipeline_cycle(Pipeline *p, CPUState *cpu, Memory *mem) {
     }
 
     /* ============================ IF ============================ */
-    if (stall) {
-        nx.if_id = p->if_id;        /* freeze: same instruction retries ID next cycle */
-        nx.stalls++;                /* cpu->pc not advanced */
-    } else {
+    if (!stall) {                   /* stalled: IF/ID already frozen, cpu->pc not advanced */
         uint32_t fetch_pc = flush ? redirect_pc : cpu->pc;
         IFID *o = &nx.if_id;
         o->valid = 1;
@@ -289,10 +281,12 @@ CPUStatus pipeline_cycle(Pipeline *p, CPUState *cpu, Memory *mem) {
     if (flush) nx.flushes++;
 
 #ifdef PIPE_TRACE
-    fprintf(stderr, "c%-4llu IF:%08x ID:%c EX:%c MEM:%c WB:%c %s%s\n",
+    fprintf(stderr, "c%-3llu IF=%04x ID=%04x EX=%04x MEM=%04x WB=%04x %s%s\n",
             (unsigned long long)nx.cycles, nx.if_id.pc,
-            nx.id_ex.valid ? '*' : '.', nx.ex_mem.valid ? '*' : '.',
-            nx.mem_wb.valid ? '*' : '.', p->mem_wb.valid ? '*' : '.',
+            p->if_id.valid  ? p->if_id.pc  : 0xFFFF,
+            p->id_ex.valid  ? p->id_ex.pc  : 0xFFFF,
+            p->ex_mem.valid ? p->ex_mem.pc : 0xFFFF,
+            p->mem_wb.valid ? p->mem_wb.pc : 0xFFFF,
             stall ? "STALL " : "", flush ? "FLUSH" : "");
 #endif
 
@@ -310,8 +304,12 @@ void pipeline_run_batch(Pipeline *p, CPUState *cpu, Memory *mem, uint64_t max_cy
     if (cpu->status == CPU_RUNNING) {
         printf("  -> stopped: reached max cycle limit (%llu)\n", (unsigned long long)max_cycles);
     }
-    double cpi = p->retired ? (double)p->cycles / (double)p->retired : 0.0;
-    printf("pipeline: cycles=%llu retired=%llu stalls=%llu flushes=%llu CPI=%.3f\n",
+    printf("pipeline: mode=%s cycles=%llu retired=%llu stalls=%llu flushes=%llu "
+           "CPI=%.3f fwd_ex=%llu fwd_mem=%llu load_use=%llu\n",
+           p->forwarding ? "forward" : "stall",
            (unsigned long long)p->cycles, (unsigned long long)p->retired,
-           (unsigned long long)p->stalls, (unsigned long long)p->flushes, cpi);
+           (unsigned long long)p->stalls, (unsigned long long)p->flushes,
+           p->retired ? (double)p->cycles / (double)p->retired : 0.0,
+           (unsigned long long)p->fwd_ex, (unsigned long long)p->fwd_mem,
+           (unsigned long long)p->load_use_stalls);
 }
