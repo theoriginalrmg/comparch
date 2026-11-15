@@ -56,11 +56,13 @@ typedef struct {
 typedef struct{
 	IFID if_id; IDEX id_ex; EXMEM ex_mem; MEMWB mem_wb;
 	uint64_t cycles,retired,stalls,flushes;
+	uint64_t load_use_stalls;   /* Lab 3: subset of stalls caused by load-use */
+	uint64_t fwd_ex,fwd_mem;    /* Lab 3: operands forwarded from EX/MEM, MEM/WB */
+	int forwarding;             /* Lab 3: 0 = stall-only, 1 = forwarding */
 }Pipeline;
 
 
-void pipeline_init(Pipeline *p);
+void pipeline_init(Pipeline *p, int forwarding);
 CPUStatus pipeline_cycle(Pipeline *p,CPUState *cpu,Memory *mem);
 void pipeline_run_batch(Pipeline *p,CPUState *cpu,Memory *mem,uint64_t max_cycles);
-
 #endif
