@@ -1,5 +1,5 @@
 #include "pipeline.h"
-#include "decoder.h"
+#include "../core/decoder.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -317,11 +317,14 @@ static inline int32_t imm_j(uint32_t raw) {
 
 /* Where to fetch after the word `raw` at `pc`. */
 static inline uint32_t predict_next(const PipelineState *p, uint32_t pc, uint32_t raw) {
-    (void)p;
-    /* TODO(lab3): branch (OPC_BRANCH) -> ask p->cfg.predictor->predict() with
-     * target pc + imm_b(raw); jal (OPC_JAL) -> pc + imm_j(raw); else pc + 4. */
-    (void)raw;
-    return pc + 4;
+    uint32_t op = raw & 0x7Fu;
+    if (op == OPC_BRANCH) {                 /* conditional branch: ask the predictor */
+        uint32_t target = pc + (uint32_t)imm_b(raw);
+        return p->cfg.predictor->predict(&p->bp, pc, target) ? target : pc + 4;
+    }
+    if (op == OPC_JAL)                      /* jal: target is in the immediate, always right */
+        return pc + (uint32_t)imm_j(raw);
+    return pc + 4;                          /* everything else, including jalr */
 }
 
 static void stage_if(PipelineState *p, const Memory *mem, const ExOutcome *o, int stall) {
