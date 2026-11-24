@@ -15,7 +15,7 @@
  * instruction is FMT_R, so it automatically reads rs1/rs2 and writes rd.
  */
 
-#include "isa_registry.h"
+#include "../core/isa_registry.h"
 
 #define REG_NONE (-1)   /* "no register": unused operand, or x0 (never a real dependency) */
 

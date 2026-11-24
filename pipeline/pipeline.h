@@ -46,10 +46,10 @@
  */
 
 #include <stddef.h>
-#include "cpu_state.h"
-#include "memory.h"
-#include "isa_registry.h"
-#include "sim_engine.h"
+#include "../core/cpu_state.h"
+#include "../core/memory.h"
+#include "../core/isa_registry.h"
+#include "../core/sim_engine.h"
 #include "control.h"
 #include "hazard.h"
 #include "branch_predictor.h"

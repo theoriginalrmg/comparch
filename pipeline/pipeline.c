@@ -1,5 +1,5 @@
 #include "pipeline.h"
-#include "decoder.h"
+#include "../core/decoder.h"
 
 #include <stdio.h>
 #include <string.h>
