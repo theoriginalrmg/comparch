@@ -39,13 +39,66 @@ static inline void set_mem_width(Control *c, uint32_t funct3) {
 void control_from_instr(const InstructionHandler *h, const DecodedInstr *d, Control *out) {
     memset(out, 0, sizeof(*out));
     out->src1 = out->src2 = out->src3 = out->dst = REG_NONE;
-    (void)h; (void)d;
-    /* TODO(lab1/lab5): fill *out from the instruction format (h->format)
-     * and the FP operand flags (isa_flags(h): IF_RD_FP, IF_RS1_FP, ...):
-     *   src1 / src2 / src3 / dst   unified register numbers (REG_NONE if unused;
-     *                              x0 is always REG_NONE; f regs = REG_FP_BASE + n)
-     *   mem_op, mem_size, mem_unsigned   for loads / stores (incl. flw / fsw)
-     *   is_branch, is_jump, is_ecall
-     * The helpers above (reg_or_none, operand, set_mem_width) do the fiddly
-     * parts. Do not forget FMT_R2, FMT_R4, FMT_CSR and FMT_CSRI. */
+    uint32_t fl = isa_flags(h);
+
+    switch (h->format) {
+    case FMT_R:                                   /* rd, rs1, rs2 */
+        out->src1 = operand(d->rs1, fl, IF_RS1_FP);
+        out->src2 = operand(d->rs2, fl, IF_RS2_FP);
+        out->dst  = operand(d->rd,  fl, IF_RD_FP);
+        break;
+
+    case FMT_I:                                   /* rd, rs1, imm */
+    case FMT_I_SHAMT:                             /* rd, rs1, shamt */
+        out->src1 = operand(d->rs1, fl, IF_RS1_FP);
+        out->dst  = operand(d->rd,  fl, IF_RD_FP);
+        break;
+
+    case FMT_I_LOAD:                              /* rd, imm(rs1): the address is always an x register */
+        out->src1   = reg_or_none(d->rs1);
+        out->dst    = operand(d->rd, fl, IF_RD_FP);
+        out->mem_op = MEMOP_LOAD;
+        set_mem_width(out, d->funct3);
+        break;
+
+    case FMT_S:                                   /* rs2, imm(rs1): rs2 is the data */
+        out->src1   = reg_or_none(d->rs1);
+        out->src2   = operand(d->rs2, fl, IF_RS2_FP);
+        out->mem_op = MEMOP_STORE;
+        set_mem_width(out, d->funct3);
+        break;
+
+    case FMT_B:                                   /* rs1, rs2, label */
+        out->src1      = reg_or_none(d->rs1);
+        out->src2      = reg_or_none(d->rs2);
+        out->is_branch = 1;
+        break;
+
+    case FMT_U:                                   /* rd, imm */
+        out->dst = reg_or_none(d->rd);
+        break;
+
+    case FMT_J:                                   /* jal rd, label: writes the link value */
+        out->dst     = reg_or_none(d->rd);
+        out->is_jump = 1;
+        break;
+
+    case FMT_I_JALR:                              /* jalr rd, imm(rs1) */
+        out->src1    = reg_or_none(d->rs1);
+        out->dst     = reg_or_none(d->rd);
+        out->is_jump = 1;
+        break;
+
+    case FMT_I_SYS:                               /* ecall: runs in EX, reads a7 (service) and a0 (argument) */
+        out->src1     = 17;                       /* a7 */
+        out->src2     = 10;                       /* a0 */
+        out->is_ecall = 1;
+        break;
+
+    case FMT_R2:                                  /* TODO(lab5) */
+    case FMT_R4:                                  /* TODO(lab5) */
+    case FMT_CSR:                                 /* TODO(lab5) */
+    case FMT_CSRI:                                /* TODO(lab5) */
+        break;
+    }
 }

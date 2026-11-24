@@ -1,5 +1,5 @@
 #include "pipeline.h"
-#include "../core/decoder.h"
+#include "decoder.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -64,11 +64,26 @@ void pipeline_reset(PipelineState *p, uint32_t start_pc, const PipelineConfig *c
 
 /* Returns 1 if the machine stopped (fault or exit) this cycle. */
 static int stage_wb(PipelineState *p, CPUState *cpu) {
-    (void)p; (void)cpu;
-    /* TODO(lab1): if MEM/WB holds a valid instruction: raise its fault (copy
-     * into cpu->status / fault_addr / fault_msg, set cpu->pc, return 1), or
-     * write wb_val to ctrl.dst (unified_write), count stats.retired, and on
-     * exit_requested set CPU_ECALL_EXIT + cpu->pc and return 1. */
+    MEM_WB_Latch *w = &p->mem_wb;
+    if (!w->valid) return 0;
+
+    /* The only place a fault becomes visible (precise exceptions). */
+    if (has_fault(&w->fault)) {
+        cpu->status     = w->fault.status;
+        cpu->fault_addr = w->fault.addr;
+        snprintf(cpu->fault_msg, sizeof(cpu->fault_msg), "%s", w->fault.msg);
+        cpu->pc = w->pc;
+        return 1;
+    }
+
+    if (w->ctrl.dst != REG_NONE) unified_write(cpu, w->ctrl.dst, w->wb_val);
+    p->stats.retired++;
+
+    if (w->exit_requested) {          /* ecall exit retires: the machine halts here */
+        cpu->status = CPU_ECALL_EXIT;
+        cpu->pc = w->pc;
+        return 1;
+    }
     return 0;
 }
 
@@ -99,12 +114,37 @@ static inline MemStatus mem_store(Memory *mem, uint32_t addr, int size, uint32_t
 /* Returns 1 if this instruction faulted here (younger instructions must
  * then be squashed and fetch stopped). */
 static int stage_mem(PipelineState *p, Memory *mem) {
-    (void)p; (void)mem;
-    /* TODO(lab1): copy EX/MEM into MEM/WB (wb_val = alu_result); perform the
-     * load (mem_load + extend_load) or store (mem_store) of ctrl.mem_size
-     * bytes at alu_result; on an out-of-bounds access fault_set() the
-     * MEM/WB fault and return 1. */
-    p->mem_wb.valid = 0;
+    const EX_MEM_Latch *e = &p->ex_mem;    /* read before MEM/WB is overwritten */
+    MEM_WB_Latch *o = &p->mem_wb;
+
+    if (!e->valid) { o->valid = 0; return 0; }
+
+    o->valid          = 1;
+    o->pc             = e->pc;
+    o->raw            = e->raw;
+    o->fault          = e->fault;
+    o->ctrl           = e->ctrl;
+    o->wb_val         = e->alu_result;
+    o->exit_requested = e->exit_requested;
+
+    if (has_fault(&e->fault)) return 0;   /* already faulty: just carry it to WB */
+
+    uint32_t addr = e->alu_result;
+    const char *mn = e->handler ? e->handler->mnemonic : "access";
+
+    if (e->ctrl.mem_op == MEMOP_LOAD) {
+        uint32_t v = 0;
+        if (mem_load(mem, addr, e->ctrl.mem_size, &v) != MEM_OK) {
+            fault_set(&o->fault, CPU_MEM_FAULT, addr, "%s out of bounds at address 0x%08x", mn, addr);
+            return 1;
+        }
+        o->wb_val = extend_load(v, e->ctrl.mem_size, e->ctrl.mem_unsigned);
+    } else if (e->ctrl.mem_op == MEMOP_STORE) {
+        if (mem_store(mem, addr, e->ctrl.mem_size, e->store_val) != MEM_OK) {
+            fault_set(&o->fault, CPU_MEM_FAULT, addr, "%s out of bounds at address 0x%08x", mn, addr);
+            return 1;
+        }
+    }
     return 0;
 }
 
@@ -121,28 +161,91 @@ typedef struct {
 /* The forwarding mux in front of each ALU input. */
 static inline uint32_t forward_mux(uint32_t from_regfile, ForwardSel sel, const PipelineState *cur,
                             PipelineStats *stats) {
-    (void)sel; (void)cur; (void)stats;
-    /* TODO(lab2): FWD_EX_MEM -> cur->ex_mem.alu_result, FWD_MEM_WB ->
-     * cur->mem_wb.wb_val (count stats->forwards), else the register file. */
+    if (sel == FWD_EX_MEM) { stats->forwards++; return cur->ex_mem.alu_result; }
+    if (sel == FWD_MEM_WB) { stats->forwards++; return cur->mem_wb.wb_val; }
     return from_regfile;
 }
 
 static void stage_ex(PipelineState *p, CPUState *cpu, Memory *mem, const PipelineState *cur,
                      const HazardDecision *hz, ExOutcome *o) {
-    (void)p; (void)cpu; (void)mem; (void)cur; (void)hz; (void)o;
-    /* TODO(lab1..lab3, lab5):
-     *   copy ID/EX into EX/MEM; an instruction carrying a fault sets o->stop;
-     *   operands = forward_mux(srcN_val, hz->fwdN, ...);
-     *   load/store: alu_result = rs1 + imm, store_val = rs2 (no handler call);
-     *   otherwise run d->handler->execute() on a scratch CPUState holding
-     *   only the operands (+ pc, next_pc = pc + 4, and cpu->fcsr), read the
-     *   result back from ctrl.dst, copy the scratch fcsr back to cpu->fcsr;
-     *   ecall exit -> exit_requested + o->stop; handler fault -> fault_set +
-     *   o->stop;
-     *   branches: count stats.branches / branch_mispredicts and call
-     *   p->cfg.predictor->update(); jumps: count stats.jal / stats.jalr;
-     *   next_pc != d->pred_next -> o->redirect, o->target, stats.redirects. */
-    p->ex_mem.valid = 0;
+    const ID_EX_Latch *d = &p->id_ex;      /* read before EX/MEM is overwritten */
+    EX_MEM_Latch *x = &p->ex_mem;
+
+    if (!d->valid) { x->valid = 0; return; }
+
+    x->valid          = 1;
+    x->pc             = d->pc;
+    x->raw            = d->raw;
+    x->fault          = d->fault;
+    x->handler        = d->handler;
+    x->ctrl           = d->ctrl;
+    x->alu_result     = 0;
+    x->store_val      = 0;
+    x->exit_requested = 0;
+
+    /* Carried fault (illegal instruction / fetch fault): never executes,
+     * and nothing younger may run after it. */
+    if (has_fault(&d->fault)) { o->stop = 1; return; }
+
+    /* Operands: register-file value, or a newer one from the hazard unit. */
+    uint32_t a = forward_mux(d->src1_val, hz->fwd1, cur, &p->stats);
+    uint32_t b = forward_mux(d->src2_val, hz->fwd2, cur, &p->stats);
+    uint32_t c = forward_mux(d->src3_val, hz->fwd3, cur, &p->stats);
+
+    /* Loads/stores: EX only computes the address, MEM does the access. */
+    if (d->ctrl.mem_op != MEMOP_NONE) {
+        x->alu_result = a + (uint32_t)d->instr.imm;
+        x->store_val  = b;
+        return;
+    }
+
+    /* Everything else: run the instruction's own single-cycle handler on a
+     * scratch CPU that holds only this instruction's operands. Its result
+     * is read back from dst, and its next_pc tells us where control goes. */
+    CPUState s;
+    memset(&s, 0, sizeof(s));
+    s.status  = CPU_RUNNING;
+    s.pc      = d->pc;
+    s.next_pc = d->pc + 4;
+    s.fcsr    = cpu->fcsr;
+    if (d->ctrl.src1 != REG_NONE) unified_write(&s, d->ctrl.src1, a);
+    if (d->ctrl.src2 != REG_NONE) unified_write(&s, d->ctrl.src2, b);
+    if (d->ctrl.src3 != REG_NONE) unified_write(&s, d->ctrl.src3, c);
+
+    DecodedInstr ins = d->instr;
+    d->handler->execute(&s, mem, &ins);
+
+    cpu->fcsr = s.fcsr;                     /* fcsr updated in program order, in EX */
+    if (d->ctrl.dst != REG_NONE) x->alu_result = unified_read(&s, d->ctrl.dst);
+
+    if (d->ctrl.is_ecall && s.status == CPU_ECALL_EXIT) {
+        x->exit_requested = 1;              /* halts when it retires */
+        o->stop = 1;                        /* fetch nothing more */
+        return;
+    }
+    if (s.status != CPU_RUNNING) {          /* the handler itself faulted */
+        fault_set(&x->fault, s.status, s.fault_addr, "%s", s.fault_msg);
+        o->stop = 1;
+        return;
+    }
+
+    /* Branches and jumps resolve here: compare with what IF guessed. */
+    uint32_t next_pc = s.next_pc;
+    if (d->ctrl.is_branch) {
+        uint32_t target = d->pc + (uint32_t)d->instr.imm;
+        int taken = (next_pc != d->pc + 4);
+        p->stats.branches++;
+        if (next_pc != d->pred_next) p->stats.branch_mispredicts++;
+        p->cfg.predictor->update(&p->bp, d->pc, target, taken);
+    } else if (d->ctrl.is_jump) {
+        if ((d->raw & 0x7Fu) == OPC_JAL) p->stats.jal++;
+        else                             p->stats.jalr++;
+    }
+    if ((d->ctrl.is_branch || d->ctrl.is_jump) && next_pc != d->pred_next) {
+        o->redirect = 1;                    /* squash IF and ID, refetch */
+        o->target   = next_pc;
+        p->stats.redirects++;
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -154,12 +257,42 @@ static void stage_ex(PipelineState *p, CPUState *cpu, Memory *mem, const Pipelin
  * `stall`: the hazard unit says wait -- IF/ID is left untouched (IF holds
  * it too) and a bubble goes into EX. */
 static void stage_id(PipelineState *p, const CPUState *cpu, int squash, int wrong_path, int stall) {
-    (void)p; (void)cpu; (void)squash; (void)wrong_path; (void)stall;
-    /* TODO(lab1): squash (count stats.squashed when wrong_path) or stall ->
-     * bubble into ID/EX; otherwise decode_instruction() (illegal ->
-     * fault_set), control_from_instr(), and read src1/src2/src3 from the
-     * register file (unified_read). */
-    p->id_ex.valid = 0;
+    const IF_ID_Latch *f = &p->if_id;
+    ID_EX_Latch *o = &p->id_ex;
+
+    if (squash) {                           /* killed by a redirect / exit / fault in EX */
+        if (f->valid && wrong_path) p->stats.squashed++;
+        o->valid = 0;
+        return;
+    }
+    if (stall || !f->valid) {               /* stall: IF/ID left untouched, bubble into EX */
+        o->valid = 0;
+        return;
+    }
+
+    memset(o, 0, sizeof(*o));
+    o->valid     = 1;
+    o->pc        = f->pc;
+    o->raw       = f->raw;
+    o->fault     = f->fault;
+    o->pred_next = f->pred_next;
+    o->ctrl.src1 = o->ctrl.src2 = o->ctrl.src3 = o->ctrl.dst = REG_NONE;
+
+    if (has_fault(&f->fault)) return;       /* fetch fault: carried down, never decoded */
+
+    const InstructionHandler *h = NULL;
+    if (decode_instruction(f->raw, &o->instr, &h) != DECODE_OK) {
+        fault_set(&o->fault, CPU_ILLEGAL_INSTRUCTION, f->pc,
+                  "unknown instruction 0x%08x at pc=0x%08x (no handler registered)", f->raw, f->pc);
+        return;                             /* do not touch h */
+    }
+    o->handler = h;
+    control_from_instr(h, &o->instr, &o->ctrl);
+
+    /* Register read. WB has already written this cycle (write first, read second). */
+    if (o->ctrl.src1 != REG_NONE) o->src1_val = unified_read(cpu, o->ctrl.src1);
+    if (o->ctrl.src2 != REG_NONE) o->src2_val = unified_read(cpu, o->ctrl.src2);
+    if (o->ctrl.src3 != REG_NONE) o->src3_val = unified_read(cpu, o->ctrl.src3);
 }
 
 /* ------------------------------------------------------------------ */
@@ -192,12 +325,34 @@ static inline uint32_t predict_next(const PipelineState *p, uint32_t pc, uint32_
 }
 
 static void stage_if(PipelineState *p, const Memory *mem, const ExOutcome *o, int stall) {
-    (void)p; (void)mem; (void)o; (void)stall;
-    /* TODO(lab1): o->stop -> bubble + fetch_stopped; o->redirect -> squash the
-     * word fetched this cycle (stats.squashed) and fetch_pc = o->target;
-     * stall -> hold IF/ID; otherwise fetch memory[fetch_pc] into IF/ID
-     * (fetch fault -> fault_set), pred_next = predict_next(), advance. */
-    p->if_id.valid = 0;
+    IF_ID_Latch *f = &p->if_id;
+
+    if (o->stop) {                          /* exit / fault on the correct path */
+        f->valid = 0;
+        p->fetch_stopped = 1;
+        return;
+    }
+    if (o->redirect) {                      /* the word fetched this cycle was on the wrong path */
+        if (!p->fetch_stopped) p->stats.squashed++;
+        f->valid = 0;
+        p->fetch_pc = o->target;
+        return;
+    }
+    if (stall) return;                      /* hold IF/ID and fetch_pc */
+    if (p->fetch_stopped) { f->valid = 0; return; }
+
+    f->valid = 1;
+    f->pc    = p->fetch_pc;
+    f->raw   = 0;
+    fault_clear(&f->fault);
+    if (memory_read_word(mem, p->fetch_pc, &f->raw) != MEM_OK) {
+        fault_set(&f->fault, CPU_MEM_FAULT, p->fetch_pc,
+                  "instruction fetch out of bounds at pc=0x%08x", p->fetch_pc);
+        f->pred_next = p->fetch_pc + 4;
+    } else {
+        f->pred_next = predict_next(p, p->fetch_pc, f->raw);
+    }
+    p->fetch_pc = f->pred_next;
 }
 
 /* ------------------------------------------------------------------ */
