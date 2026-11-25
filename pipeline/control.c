@@ -95,10 +95,26 @@ void control_from_instr(const InstructionHandler *h, const DecodedInstr *d, Cont
         out->is_ecall = 1;
         break;
 
-    case FMT_R2:                                  /* TODO(lab5) */
-    case FMT_R4:                                  /* TODO(lab5) */
-    case FMT_CSR:                                 /* TODO(lab5) */
-    case FMT_CSRI:                                /* TODO(lab5) */
+    case FMT_R2:                                  /* rd, rs1: the rs2 field is part of the opcode */
+        out->src1 = operand(d->rs1, fl, IF_RS1_FP);
+        out->dst  = operand(d->rd,  fl, IF_RD_FP);
+        break;
+
+    case FMT_R4:                                  /* fused multiply-add: rd, rs1, rs2, rs3 */
+        out->src1 = operand(d->rs1, fl, IF_RS1_FP);
+        out->src2 = operand(d->rs2, fl, IF_RS2_FP);
+        out->src3 = operand(d->rs3, fl, IF_RS3_FP);
+        out->dst  = operand(d->rd,  fl, IF_RD_FP);
+        break;
+
+    case FMT_CSR:                                 /* rd, csr, rs1 (x registers; fcsr itself is
+                                                     read/written in EX, in order) */
+        out->src1 = reg_or_none(d->rs1);
+        out->dst  = reg_or_none(d->rd);
+        break;
+
+    case FMT_CSRI:                                /* rd, csr, uimm5: the rs1 field is an immediate */
+        out->dst = reg_or_none(d->rd);
         break;
     }
 }
