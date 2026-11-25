@@ -1,5 +1,5 @@
 #include "rv32m.h"
-#include "isa_registry.h"
+#include "../core/isa_registry.h"
 #include <stdint.h>
 
 /*
@@ -32,43 +32,59 @@
 #define FUNCT7_MULDIV 0x01
 
 static void exec_mul(CPUState *c, Memory *m, DecodedInstr *i) {
-    (void)c; (void)m; (void)i;
-    /* TODO(lab4: implement this instruction (see the table above)) */
+    (void)m;
+    uint32_t a = cpu_read_reg(c, i->rs1), b = cpu_read_reg(c, i->rs2);
+    cpu_write_reg(c, i->rd, a * b);                         /* low 32 bits, unsigned: no UB */
 }
 
 static void exec_mulh(CPUState *c, Memory *m, DecodedInstr *i) {
-    (void)c; (void)m; (void)i;
-    /* TODO(lab4: implement this instruction (see the table above)) */
+    (void)m;
+    int64_t p = (int64_t)(int32_t)cpu_read_reg(c, i->rs1) * (int64_t)(int32_t)cpu_read_reg(c, i->rs2);
+    cpu_write_reg(c, i->rd, (uint32_t)((uint64_t)p >> 32)); /* signed x signed, high word */
 }
 
 static void exec_mulhsu(CPUState *c, Memory *m, DecodedInstr *i) {
-    (void)c; (void)m; (void)i;
-    /* TODO(lab4: implement this instruction (see the table above)) */
+    (void)m;
+    int64_t p = (int64_t)(int32_t)cpu_read_reg(c, i->rs1) * (int64_t)(uint64_t)cpu_read_reg(c, i->rs2);
+    cpu_write_reg(c, i->rd, (uint32_t)((uint64_t)p >> 32)); /* signed x unsigned, high word */
 }
 
 static void exec_mulhu(CPUState *c, Memory *m, DecodedInstr *i) {
-    (void)c; (void)m; (void)i;
-    /* TODO(lab4: implement this instruction (see the table above)) */
+    (void)m;
+    uint64_t p = (uint64_t)cpu_read_reg(c, i->rs1) * (uint64_t)cpu_read_reg(c, i->rs2);
+    cpu_write_reg(c, i->rd, (uint32_t)(p >> 32));           /* unsigned x unsigned, high word */
 }
 
 static void exec_div(CPUState *c, Memory *m, DecodedInstr *i) {
-    (void)c; (void)m; (void)i;
-    /* TODO(lab4: implement this instruction (see the table above)) */
+    (void)m;
+    int32_t a = (int32_t)cpu_read_reg(c, i->rs1), b = (int32_t)cpu_read_reg(c, i->rs2);
+    int32_t r;
+    if (b == 0)                       r = -1;               /* divide by zero: no trap */
+    else if (a == INT32_MIN && b == -1) r = INT32_MIN;      /* overflow: UB in C */
+    else                              r = a / b;            /* truncates toward zero */
+    cpu_write_reg(c, i->rd, (uint32_t)r);
 }
 
 static void exec_divu(CPUState *c, Memory *m, DecodedInstr *i) {
-    (void)c; (void)m; (void)i;
-    /* TODO(lab4: implement this instruction (see the table above)) */
+    (void)m;
+    uint32_t a = cpu_read_reg(c, i->rs1), b = cpu_read_reg(c, i->rs2);
+    cpu_write_reg(c, i->rd, b == 0 ? 0xFFFFFFFFu : a / b);
 }
 
 static void exec_rem(CPUState *c, Memory *m, DecodedInstr *i) {
-    (void)c; (void)m; (void)i;
-    /* TODO(lab4: implement this instruction (see the table above)) */
+    (void)m;
+    int32_t a = (int32_t)cpu_read_reg(c, i->rs1), b = (int32_t)cpu_read_reg(c, i->rs2);
+    int32_t r;
+    if (b == 0)                       r = a;                /* x % 0 = x */
+    else if (a == INT32_MIN && b == -1) r = 0;
+    else                              r = a % b;            /* sign of the dividend */
+    cpu_write_reg(c, i->rd, (uint32_t)r);
 }
 
 static void exec_remu(CPUState *c, Memory *m, DecodedInstr *i) {
-    (void)c; (void)m; (void)i;
-    /* TODO(lab4: implement this instruction (see the table above)) */
+    (void)m;
+    uint32_t a = cpu_read_reg(c, i->rs1), b = cpu_read_reg(c, i->rs2);
+    cpu_write_reg(c, i->rd, b == 0 ? a : a % b);
 }
 
 void register_rv32m(void) {
